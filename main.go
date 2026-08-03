@@ -182,7 +182,7 @@ func tursoExec(query string, args ...interface{}) (int64, error) {
 func tursoQuery(query string, args ...interface{}) (*tursoResponse, error) {
 	// Build SQL with args
 	finalQuery := query
-	for i, arg := range args {
+	for _, arg := range args {
 		var replacement string
 		switch v := arg.(type) {
 		case string:
@@ -1471,19 +1471,6 @@ func main() {
 		log.Fatalf("[init] db: %v", err)
 	}
 	log.Printf("[init] db opened at %s", dbPath)
-
-	emuPath := os.Getenv("EMU_KEYS_DB_PATH")
-	if emuPath == "" {
-		emuPath = emuKeysDBPath
-	}
-	var emuErr error
-	emuKeysDB, emuErr = sql.Open("sqlite3", emuPath+"?mode=ro&_busy_timeout=5000")
-	if emuErr != nil {
-		log.Printf("[init] WARNING: emu keys db unavailable (%s): %v", emuPath, emuErr)
-		emuKeysDB = nil
-	} else {
-		log.Printf("[init] emu keys db opened at %s (read-only)", emuPath)
-	}
 
 	if err := loadServerPubkey(); err != nil {
 		log.Printf("[init] WARNING: no SERVER_PUBKEY loaded yet : %v", err)
