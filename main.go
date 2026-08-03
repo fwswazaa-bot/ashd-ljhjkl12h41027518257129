@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"log"
 	"net/http"
 	"os"
