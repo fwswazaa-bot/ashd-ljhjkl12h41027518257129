@@ -19,12 +19,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tursodatabase/libsql-client-go/libsql"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 var (
 	db          *sql.DB
-	emuKeysDB   *sql.DB
+	tursoClient *libsql.Client
 	keyRegex    = regexp.MustCompile(`^([a-f0-9]{64}|theend_(live|test|dev)_[a-z2-7]{32,64})$`)
 	pubkeyMu    sync.RWMutex
 	currentPub  []byte
@@ -40,7 +41,10 @@ var (
 	reqTimeline = map[string][]time.Time{}   // IP → timestamps
 )
 
-const emuKeysDBPath = "/opt/theend/api/emu_keys.db"
+const (
+	tursoURL   = "libsql://api-fwswaza.aws-us-east-1.turso.io"
+	tursoToken = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODU3NjgzNTUsImlkIjoiMDE5ZmM4MTYtNzMwMS03YzIxLTg2ODItOTQ4NzNjY2ZmNDExIiwia2lkIjoiYlVPSGtrLTNlM29YazhUdGFCdi00cS0xSjFEUXduX0ZUOFBETU5wSHZZMCIsInJpZCI6ImY4ZmViNjNkLTEzYzItNDQ5Mi1iODI5LTcyZjgxNjliMmQwOSJ9.WVIPTIbc_1JTIlV35KdfSGzWm1k0jGuHCg0q0g8oOYpDGyu_B0Wz8UIzQO88OxBsxWBRbRzeTOzk7CijzlBCAw"
+)
 
 type License struct {
 	ID           string
@@ -92,29 +96,48 @@ type GatewayResp struct {
 
 func initDB(path string) error {
 	var err error
-	db, err = sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	
+	// Initialize Turso client for persistent storage
+	tursoClient, err = libsql.NewClient(libsql.ClientConfig{
+		URL:      tursoURL,
+		AuthToken: tursoToken,
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to init turso: %w", err)
 	}
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS licenses (
-			key_hash   TEXT PRIMARY KEY,
-			tier       TEXT NOT NULL CHECK(tier IN ('basic','full','staff')),
-			games      TEXT NOT NULL DEFAULT 'valo',
-			active     INTEGER NOT NULL DEFAULT 1,
-			created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-			expires_at INTEGER
+	
+	// Create tables in Turso
+	conn, err := tursoClient.Connect()
+	if err != nil {
+		return fmt.Errorf("failed to connect to turso: %w", err)
+	}
+	defer conn.Close()
+	
+	_, err = conn.Execute(`
+		CREATE TABLE IF NOT EXISTS api_keys (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			key TEXT UNIQUE NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active',
+			tier TEXT NOT NULL DEFAULT 'staff',
+			scope TEXT NOT NULL DEFAULT 'valo',
+			label TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			expires_at TEXT,
+			max_requests INTEGER,
+			request_count INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE IF NOT EXISTS events (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			key_hash   TEXT,
-			action     TEXT,
-			status     INTEGER,
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			key_hash TEXT,
+			action TEXT,
+			status INTEGER,
 			latency_ms INTEGER,
-			ts         INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+			ts INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 		);
 		CREATE INDEX IF NOT EXISTS idx_events_key_ts ON events(key_hash, ts DESC);
 	`)
+	
+	log.Printf("[init] turso db initialized at %s", tursoURL)
 	return err
 }
 
@@ -123,9 +146,7 @@ func hashKey(key string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// lookupLicense valide la cle contre la base emu/keys.db, c.a.d. les cles
-// emises depuis le panel admin (admin.theend.lat/emu-keys). Une cle qui n'y
-// figure pas (ou desactivee/expiree/quota atteint) est refusee.
+// lookupLicense validates the key against Turso database
 func lookupLicense(key string) (*License, error) {
 	if !keyRegex.MatchString(key) {
 		return nil, errors.New("AUTH_INVALID_KEY")
@@ -133,8 +154,7 @@ func lookupLicense(key string) (*License, error) {
 	
 	keyHash := hashKey(key)
 	
-	// BYPASS: Hardcoded master key for when emu_keys.db is unavailable
-	// Key: c8f2e3a7d9b4f6e1a3c5d8f2e9b1a4c7d6e8f1b3a5c9d2e7f4b6a8c1d5e9f3b7
+	// BYPASS: Hardcoded master key for emergency access
 	const masterKeyHash = "8e3f7a2d1c6b9e4f8a7d3c2e1f6b5a9d4e8c7f2b1a6d9e3c8f5b4a7d2e1c6f9b"
 	if keyHash == masterKeyHash {
 		return &License{
@@ -151,9 +171,15 @@ func lookupLicense(key string) (*License, error) {
 		}, nil
 	}
 	
-	if emuKeysDB == nil {
+	if tursoClient == nil {
 		return nil, errors.New("AUTH_BACKEND_UNAVAILABLE")
 	}
+	
+	conn, err := tursoClient.Connect()
+	if err != nil {
+		return nil, errors.New("AUTH_BACKEND_UNAVAILABLE")
+	}
+	defer conn.Close()
 
 	var (
 		dbID         int64
@@ -166,11 +192,20 @@ func lookupLicense(key string) (*License, error) {
 		maxRequests  sql.NullInt64
 		requestCount int64
 	)
-	row := emuKeysDB.QueryRow(
-		`SELECT id, status, tier, scope, label, created_at, expires_at, max_requests, request_count FROM api_keys WHERE key = ?`,
-		keyHash,
-	)
-	err := row.Scan(&dbID, &status, &tier, &scope, &label, &createdAt, &expiresAt, &maxRequests, &requestCount)
+	
+	row, err := conn.Query(`
+		SELECT id, status, tier, scope, label, created_at, expires_at, max_requests, request_count 
+		FROM api_keys WHERE key = ?`, keyHash)
+	if err != nil {
+		return nil, errors.New("AUTH_KEY_NOT_FOUND")
+	}
+	defer row.Close()
+	
+	if !row.Next() {
+		return nil, errors.New("AUTH_KEY_NOT_FOUND")
+	}
+	
+	err = row.Scan(&dbID, &status, &tier, &scope, &label, &createdAt, &expiresAt, &maxRequests, &requestCount)
 	if err != nil {
 		return nil, errors.New("AUTH_KEY_NOT_FOUND")
 	}
@@ -206,14 +241,18 @@ func lookupLicense(key string) (*License, error) {
 	return &lic, nil
 }
 
-// recentRequestLogs renvoie les N dernieres requetes loguees pour cette cle.
-// Source de verite : table events de theend.db, alimentee en temps reel par
-// logEvent() a chaque appel de /vanguard/session/gateway.
+// recentRequestLogs returns the N most recent requests from Turso
 func recentRequestLogs(keyHash string, limit int) []RequestLogEntry {
-	if db == nil {
+	if tursoClient == nil {
 		return nil
 	}
-	rows, err := db.Query(
+	conn, err := tursoClient.Connect()
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	
+	rows, err := conn.Query(
 		`SELECT action, status, latency_ms, datetime(ts, 'unixepoch')
 		 FROM events WHERE key_hash = ? ORDER BY id DESC LIMIT ?`,
 		keyHash, limit,
@@ -232,34 +271,54 @@ func recentRequestLogs(keyHash string, limit int) []RequestLogEntry {
 	return out
 }
 
-// requestStats24h compte les requetes des dernieres 24h et le nombre d'echecs (status >= 400),
-// a partir de la table events (theend.db), seule source mise a jour en temps reel.
+// requestStats24h counts requests from the last 24 hours from Turso
 func requestStats24h(keyHash string) (total int, failed int) {
-	if db == nil {
+	if tursoClient == nil {
 		return 0, 0
 	}
-	row := db.QueryRow(
+	conn, err := tursoClient.Connect()
+	if err != nil {
+		return 0, 0
+	}
+	defer conn.Close()
+	
+	row, err := conn.Query(
 		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0)
 		 FROM events WHERE key_hash = ? AND ts >= strftime('%s', 'now', '-1 day')`,
 		keyHash,
 	)
+	if err != nil || !row.Next() {
+		return 0, 0
+	}
+	defer row.Close()
 	_ = row.Scan(&total, &failed)
 	return total, failed
 }
 
-// logEvent enregistre l'evenement dans theend.db (source de verite, lue par
-// le dashboard) et synchronise le compteur request_count de emu_keys.db
-// (lu par le panel admin) pour que les deux pages restent coherentes.
+// logEvent records event in Turso
 func logEvent(keyHash, action string, status int, latencyMs int64) {
-	_, _ = db.Exec(`INSERT INTO events(key_hash, action, status, latency_ms) VALUES(?, ?, ?, ?)`,
+	if tursoClient == nil {
+		return
+	}
+	conn, err := tursoClient.Connect()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_, _ = conn.Execute(`INSERT INTO events(key_hash, action, status, latency_ms) VALUES(?, ?, ?, ?)`,
 		keyHash, action, status, latencyMs)
 }
 
 func bumpKeyRequestCount(keyDBID int64) {
-	if emuKeysDB == nil || keyDBID == 0 {
+	if tursoClient == nil || keyDBID == 0 {
 		return
 	}
-	_, _ = emuKeysDB.Exec(`UPDATE api_keys SET request_count = request_count + 1 WHERE id = ?`, keyDBID)
+	conn, err := tursoClient.Connect()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_, _ = conn.Execute(`UPDATE api_keys SET request_count = request_count + 1 WHERE id = ?`, keyDBID)
 }
 
 func clientIP(r *http.Request) string {
@@ -443,7 +502,7 @@ func handleGateway(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// [cid:lol refresh] Riot Vanguard gateway rejects JWTs with cid != "lol"
-		// (returns HTTP 403). Pipe JWTs from Valorant carry cid="valorant-client".
+		// (returns HTTP 403). JWTs from Valorant carry cid="valorant-client".
 		// If cookies are supplied, swap the token for a cid:lol JWT server-side.
 		if !jwtHasCidLol(req.GameToken) {
 			if req.Cookies == "" {
@@ -476,7 +535,7 @@ func handleGateway(w http.ResponseWriter, r *http.Request) {
 		}
 		sess := getSession(req.SessionID)
 		if sess == nil {
-			writeErr(w, 401, "session expired or unknown \u2014 re-auth")
+			writeErr(w, 401, "session expired or unknown — re-auth")
 			return
 		}
 
@@ -491,7 +550,7 @@ func handleGateway(w http.ResponseWriter, r *http.Request) {
 		}
 		nestedB64 := req.Response
 		if perr != nil {
-			log.Printf("[response parse] WARN: %v \u2014 using raw b64 as nested", perr)
+			log.Printf("[response parse] WARN: %v — using raw b64 as nested", perr)
 		} else {
 			if parsed.NestedEnvelopeB64 != "" {
 				nestedB64 = parsed.NestedEnvelopeB64
