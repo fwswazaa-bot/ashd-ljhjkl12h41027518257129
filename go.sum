@@ -1,4 +1,4 @@
 github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o4kU=
 github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
-github.com/tursodatabase/libsql-client-go v0.0.0-20240902231107-85af5b9d094d h1:P1NLqNsZjCabOLpT3zX7L4DS1W6F3vKl0W+6ApYV5xk=
+github.com/tursodatabase/libsql-client-go v0.0.0-20240902231107-85af5b9d094d h1:dOMI4+zEbDI37KGb0TI44GUAwxHF9cMsIoDTJ7UmgfU=
 github.com/tursodatabase/libsql-client-go v0.0.0-20240902231107-85af5b9d094d/go.mod h1:9v8N0HRbK8mOj6hLqAz4K4c/S+CRfKKrkJu0e3W4sGU=
