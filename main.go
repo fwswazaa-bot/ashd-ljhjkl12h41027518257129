@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -19,13 +21,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tursodatabase/libsql-client-go/libsql"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 var (
 	db          *sql.DB
-	tursoClient *libsql.Client
+	tursoHTTPURL string
+	tursoToken   string
 	keyRegex    = regexp.MustCompile(`^([a-f0-9]{64}|theend_(live|test|dev)_[a-z2-7]{32,64})$`)
 	pubkeyMu    sync.RWMutex
 	currentPub  []byte
@@ -39,11 +41,6 @@ var (
 	rateMax     = 20
 	rateWindow  = 10 * time.Second
 	reqTimeline = map[string][]time.Time{}   // IP → timestamps
-)
-
-const (
-	tursoURL   = "libsql://api-fwswaza.aws-us-east-1.turso.io"
-	tursoToken = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODU3NjgzNTUsImlkIjoiMDE5ZmM4MTYtNzMwMS03YzIxLTg2ODItOTQ4NzNjY2ZmNDExIiwia2lkIjoiYlVPSGtrLTNlM29YazhUdGFCdi00cS0xSjFEUXduX0ZUOFBETU5wSHZZMCIsInJpZCI6ImY4ZmViNjNkLTEzYzItNDQ5Mi1iODI5LTcyZjgxNjliMmQwOSJ9.WVIPTIbc_1JTIlV35KdfSGzWm1k0jGuHCg0q0g8oOYpDGyu_B0Wz8UIzQO88OxBsxWBRbRzeTOzk7CijzlBCAw"
 )
 
 type License struct {
@@ -97,23 +94,12 @@ type GatewayResp struct {
 func initDB(path string) error {
 	var err error
 	
-	// Initialize Turso client for persistent storage
-	tursoClient, err = libsql.NewClient(libsql.ClientConfig{
-		URL:      tursoURL,
-		AuthToken: tursoToken,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to init turso: %w", err)
-	}
+	// Initialize Turso HTTP client for persistent storage
+	tursoHTTPURL = "https://api-fwswaza.aws-us-east-1.turso.io"
+	tursoToken = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODU3NjgzNTUsImlkIjoiMDE5ZmM4MTYtNzMwMS03YzIxLTg2ODItOTQ4NzNjY2ZmNDExIiwia2lkIjoiYlVPSGtrLTNlM29YazhUdGFCdi00cS0xSjFEUXduX0ZUOFBETU5wSHZZMCIsInJpZCI6ImY4ZmViNjNkLTEzYzItNDQ5Mi1iODI5LTcyZjgxNjliMmQwOSJ9.WVIPTIbc_1JTIlV35KdfSGzWm1k0jGuHCg0q0g8oOYpDGyu_B0Wz8UIzQO88OxBsxWBRbRzeTOzk7CijzlBCAw"
 	
-	// Create tables in Turso
-	conn, err := tursoClient.Connect()
-	if err != nil {
-		return fmt.Errorf("failed to connect to turso: %w", err)
-	}
-	defer conn.Close()
-	
-	_, err = conn.Execute(`
+	// Create tables in Turso via HTTP
+	createTablesSQL := `
 		CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			key TEXT UNIQUE NOT NULL,
@@ -135,10 +121,103 @@ func initDB(path string) error {
 			ts INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 		);
 		CREATE INDEX IF NOT EXISTS idx_events_key_ts ON events(key_hash, ts DESC);
-	`)
+	`
 	
-	log.Printf("[init] turso db initialized at %s", tursoURL)
-	return err
+	_, err = tursoExec(createTablesSQL)
+	if err != nil {
+		log.Printf("[init] WARNING: turso init failed: %v", err)
+	} else {
+		log.Printf("[init] turso db initialized at %s", tursoHTTPURL)
+	}
+	
+	return nil
+}
+
+type tursoRequest struct {
+	Statements []string `json:"statements"`
+}
+
+type tursoResponse struct {
+	Results []struct {
+		Columns []string        `json:"columns"`
+		Rows    [][]interface{} `json:"rows"`
+	} `json:"results"`
+}
+
+func tursoExec(query string, args ...interface{}) (int64, error) {
+	// Build SQL with args (basic substitution for now)
+	finalQuery := query
+	for i, arg := range args {
+		placeholder := fmt.Sprintf("?%d", i+1)
+		if _, ok := arg.(string); ok {
+			finalQuery = strings.Replace(finalQuery, placeholder, fmt.Sprintf("'%v'", arg), 1)
+		} else {
+			finalQuery = strings.Replace(finalQuery, placeholder, fmt.Sprintf("%v", arg), 1)
+		}
+	}
+	finalQuery = strings.ReplaceAll(finalQuery, "?", "'?'") // Handle unindexed ?
+	
+	reqBody, _ := json.Marshal(tursoRequest{Statements: []string{finalQuery}})
+	req, err := http.NewRequest("POST", tursoHTTPURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tursoToken)
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("turso exec error %d: %s", resp.StatusCode, body)
+	}
+	
+	return 0, nil
+}
+
+func tursoQuery(query string, args ...interface{}) (*tursoResponse, error) {
+	// Build SQL with args
+	finalQuery := query
+	for i, arg := range args {
+		var replacement string
+		switch v := arg.(type) {
+		case string:
+			replacement = fmt.Sprintf("'%s'", strings.ReplaceAll(v, "'", "''"))
+		default:
+			replacement = fmt.Sprintf("%v", v)
+		}
+		finalQuery = strings.Replace(finalQuery, "?", replacement, 1)
+	}
+	
+	reqBody, _ := json.Marshal(tursoRequest{Statements: []string{finalQuery}})
+	req, err := http.NewRequest("POST", tursoHTTPURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tursoToken)
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("turso query error %d: %s", resp.StatusCode, body)
+	}
+	
+	var result tursoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	
+	return &result, nil
 }
 
 func hashKey(key string) string {
@@ -171,49 +250,51 @@ func lookupLicense(key string) (*License, error) {
 		}, nil
 	}
 	
-	if tursoClient == nil {
+	if tursoHTTPURL == "" {
 		return nil, errors.New("AUTH_BACKEND_UNAVAILABLE")
 	}
 	
-	conn, err := tursoClient.Connect()
-	if err != nil {
-		return nil, errors.New("AUTH_BACKEND_UNAVAILABLE")
-	}
-	defer conn.Close()
-
-	var (
-		dbID         int64
-		status       string
-		tier         string
-		scope        string
-		label        sql.NullString
-		createdAt    string
-		expiresAt    sql.NullString
-		maxRequests  sql.NullInt64
-		requestCount int64
-	)
-	
-	row, err := conn.Query(`
+	result, err := tursoQuery(`
 		SELECT id, status, tier, scope, label, created_at, expires_at, max_requests, request_count 
 		FROM api_keys WHERE key = ?`, keyHash)
 	if err != nil {
-		return nil, errors.New("AUTH_KEY_NOT_FOUND")
-	}
-	defer row.Close()
-	
-	if !row.Next() {
+		log.Printf("[lookup] turso query error: %v", err)
 		return nil, errors.New("AUTH_KEY_NOT_FOUND")
 	}
 	
-	err = row.Scan(&dbID, &status, &tier, &scope, &label, &createdAt, &expiresAt, &maxRequests, &requestCount)
-	if err != nil {
+	if len(result.Results) == 0 || len(result.Results[0].Rows) == 0 {
 		return nil, errors.New("AUTH_KEY_NOT_FOUND")
 	}
+	
+	row := result.Results[0].Rows[0]
+	if len(row) < 9 {
+		return nil, errors.New("AUTH_KEY_NOT_FOUND")
+	}
+	
+	dbID := int64(row[0].(float64))
+	status := row[1].(string)
+	tier := row[2].(string)
+	scope := row[3].(string)
+	var label string
+	if row[4] != nil {
+		label = row[4].(string)
+	}
+	createdAt := row[5].(string)
+	var expiresAt string
+	if row[6] != nil {
+		expiresAt = row[6].(string)
+	}
+	var maxRequests sql.NullInt64
+	if row[7] != nil {
+		maxRequests = sql.NullInt64{Valid: true, Int64: int64(row[7].(float64))}
+	}
+	requestCount := int64(row[8].(float64))
+	
 	if status != "active" {
 		return nil, errors.New("AUTH_KEY_REVOKED")
 	}
-	if expiresAt.Valid && expiresAt.String != "" {
-		if t, perr := time.Parse("2006-01-02 15:04:05", expiresAt.String); perr == nil {
+	if expiresAt != "" {
+		if t, perr := time.Parse("2006-01-02 15:04:05", expiresAt); perr == nil {
 			if time.Now().After(t) {
 				return nil, errors.New("AUTH_KEY_EXPIRED")
 			}
@@ -229,9 +310,9 @@ func lookupLicense(key string) (*License, error) {
 		Tier:         tier,
 		Games:        scope,
 		Active:       true,
-		Label:        label.String,
+		Label:        label,
 		CreatedAt:    createdAt,
-		ExpiresAt:    expiresAt.String,
+		ExpiresAt:    expiresAt,
 		MaxRequests:  maxRequests,
 		RequestCount: requestCount,
 	}
@@ -243,28 +324,28 @@ func lookupLicense(key string) (*License, error) {
 
 // recentRequestLogs returns the N most recent requests from Turso
 func recentRequestLogs(keyHash string, limit int) []RequestLogEntry {
-	if tursoClient == nil {
+	if tursoHTTPURL == "" {
 		return nil
 	}
-	conn, err := tursoClient.Connect()
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
 	
-	rows, err := conn.Query(
+	result, err := tursoQuery(
 		`SELECT action, status, latency_ms, datetime(ts, 'unixepoch')
 		 FROM events WHERE key_hash = ? ORDER BY id DESC LIMIT ?`,
 		keyHash, limit,
 	)
-	if err != nil {
+	if err != nil || len(result.Results) == 0 {
 		return nil
 	}
-	defer rows.Close()
+	
 	var out []RequestLogEntry
-	for rows.Next() {
-		var e RequestLogEntry
-		if rows.Scan(&e.Action, &e.Status, &e.LatencyMs, &e.CreatedAt) == nil {
+	for _, row := range result.Results[0].Rows {
+		if len(row) >= 4 {
+			e := RequestLogEntry{
+				Action:    row[0].(string),
+				Status:    int(row[1].(float64)),
+				LatencyMs: int64(row[2].(float64)),
+				CreatedAt: row[3].(string),
+			}
 			out = append(out, e)
 		}
 	}
@@ -273,52 +354,41 @@ func recentRequestLogs(keyHash string, limit int) []RequestLogEntry {
 
 // requestStats24h counts requests from the last 24 hours from Turso
 func requestStats24h(keyHash string) (total int, failed int) {
-	if tursoClient == nil {
+	if tursoHTTPURL == "" {
 		return 0, 0
 	}
-	conn, err := tursoClient.Connect()
-	if err != nil {
-		return 0, 0
-	}
-	defer conn.Close()
 	
-	row, err := conn.Query(
+	result, err := tursoQuery(
 		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0)
 		 FROM events WHERE key_hash = ? AND ts >= strftime('%s', 'now', '-1 day')`,
 		keyHash,
 	)
-	if err != nil || !row.Next() {
+	if err != nil || len(result.Results) == 0 || len(result.Results[0].Rows) == 0 {
 		return 0, 0
 	}
-	defer row.Close()
-	_ = row.Scan(&total, &failed)
+	
+	row := result.Results[0].Rows[0]
+	if len(row) >= 2 {
+		total = int(row[0].(float64))
+		failed = int(row[1].(float64))
+	}
 	return total, failed
 }
 
 // logEvent records event in Turso
 func logEvent(keyHash, action string, status int, latencyMs int64) {
-	if tursoClient == nil {
+	if tursoHTTPURL == "" {
 		return
 	}
-	conn, err := tursoClient.Connect()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	_, _ = conn.Execute(`INSERT INTO events(key_hash, action, status, latency_ms) VALUES(?, ?, ?, ?)`,
+	_, _ = tursoExec(`INSERT INTO events(key_hash, action, status, latency_ms) VALUES(?, ?, ?, ?)`,
 		keyHash, action, status, latencyMs)
 }
 
 func bumpKeyRequestCount(keyDBID int64) {
-	if tursoClient == nil || keyDBID == 0 {
+	if tursoHTTPURL == "" || keyDBID == 0 {
 		return
 	}
-	conn, err := tursoClient.Connect()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	_, _ = conn.Execute(`UPDATE api_keys SET request_count = request_count + 1 WHERE id = ?`, keyDBID)
+	_, _ = tursoExec(`UPDATE api_keys SET request_count = request_count + 1 WHERE id = ?`, keyDBID)
 }
 
 func clientIP(r *http.Request) string {
